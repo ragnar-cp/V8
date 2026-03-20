@@ -576,7 +576,7 @@ mt5_status = {
 # ════════════════════════════════════════════════════════════════════
 
 def check_mt5_connection():
-    global mt5_status
+    global mt5_status, _last_connection_state
     try:
         t0   = time.time()
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -607,8 +607,7 @@ def check_mt5_connection():
         positions = mt5.positions_get()
         mt5_status["open_positions"] = len(positions) if positions else 0
 
-        # Reconnect alert
-        global _last_connection_state
+        # Reconnect alert — fires once when coming back online
         if not _last_connection_state:
             notifier.connection_restored(info.balance)
         _last_connection_state = True
@@ -616,8 +615,7 @@ def check_mt5_connection():
     except Exception as e:
         mt5_status["connected"] = False
         mt5_status["error"]     = str(e)
-        # Disconnect alert — only fires once, not every 0.3s
-        global _last_connection_state
+        # Disconnect alert — fires once, not every 0.3s
         if _last_connection_state:
             notifier.connection_lost()
         _last_connection_state = False
