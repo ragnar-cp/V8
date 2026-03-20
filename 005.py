@@ -1,6 +1,6 @@
 """
-Grid Strategy — Live Engine (Vantage MT5 Direct)
-=================================================
+Grid Strategy + Signal Filter — Live Engine (Vantage MT5 Direct)
+=================================================================
 
 SETUP:
 1. Vantage MT5 installed and logged in
@@ -23,6 +23,22 @@ SETUP:
 #   DAILY_SL_USD         = 3000 (fixed $ daily stop loss)
 #   COOLDOWN_BARS        = 2    (wait 30 mins after exit)
 #   GRID_STEP            = 15   (grid spacing in pts)
+#   MIN_CONFIDENCE       = 45   (minimum signal score % to enter)
+#
+# ═══════════════════════════════════════════════════════════════
+# SIGNAL FILTER — same as backtest
+# ═══════════════════════════════════════════════════════════════
+#
+#   Scores each candle 0-95% across 5 layers:
+#     1. EMA trend alignment (EMA50 / EMA200)
+#     2. Candlestick patterns (Engulfing, Pin Bar, Stars, etc.)
+#     3. RSI overbought / oversold
+#     4. Support & Resistance proximity
+#     5. MACD momentum
+#
+#   Entry only fires if:
+#     confidence >= MIN_CONFIDENCE
+#     AND candle direction matches signal direction
 #
 # ═══════════════════════════════════════════════════════════════
 # EXIT LOGIC
@@ -35,11 +51,11 @@ SETUP:
 #       Grid triggers + Stop Loss + Manual close detection
 #
 #   on_new_candle() — every 15-min candle close:
-#       TP (no grid)  → profit at close, high/low confirmed TP pts
+#       TP (no grid)  → high/low confirmed TP pts, exit at close
 #       G1 exit       → profit at close >= TARGET_PROFIT
 #       G2 exit       → profit at close >= TARGET_PROFIT_G2
 #       Break-even    → profit at close > 0 (Grid 3+)
-#       New entry
+#       New entry     → signal scored, confidence checked
 #
 # ═══════════════════════════════════════════════════════════════
 """
@@ -79,8 +95,6 @@ TARGET_PROFIT        = 50.0
 TARGET_PROFIT_G2     = 20.0
 DAILY_SL_USD         = 3000.0
 COOLDOWN_BARS        = 2
-EMA_PERIOD           = 200
-ATR_PERIOD           = 14
 GRID_LOT_MULTIPLIERS = [2, 4]
 FIXED_LOT            = 0.05
 INITIAL_CAPITAL      = 10000
@@ -88,6 +102,20 @@ STATE_FILE           = "grid_state.json"
 WARMUP_BARS          = 250
 MAGIC_NUMBER         = 20250101
 ENTRY_GUARD_SECS     = 5
+
+# Signal filter parameters — must match backtest CONFIG
+MIN_CONFIDENCE   = 45
+EMA_FAST         = 50
+EMA_SLOW         = 200
+RSI_PERIOD       = 14
+ATR_PERIOD       = 14
+MACD_FAST        = 12
+MACD_SLOW        = 26
+MACD_SIGNAL_PERIOD = 9
+SR_LOOKBACK      = 100
+SR_ZONE_ATR_MULT = 0.3
+SR_MIN_TOUCHES   = 2
+SR_NEAR_ATR_MULT = 0.5
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -120,7 +148,7 @@ def get_server_time():
 
 
 # ════════════════════════════════════════════════════════════════════
-#  INCREMENTAL INDICATORS
+#  INCREMENTAL INDICATORS  (EMA200 + ATR for warmup tracking)
 # ════════════════════════════════════════════════════════════════════
 
 class IncrementalEMA:
@@ -171,6 +199,192 @@ class IncrementalATR:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  SIGNAL FILTER ENGINE
+#  Exact replication of backtest Cell 4 — no changes
+# ════════════════════════════════════════════════════════════════════
+
+def _calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def _calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    ag    = gain.ewm(alpha=1/period, adjust=False).mean()
+    al    = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs    = ag / al.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def _calc_macd(series, fast=12, slow=26, signal=9):
+    ml = _calc_ema(series, fast) - _calc_ema(series, slow)
+    sl = _calc_ema(ml, signal)
+    return ml, sl, ml - sl
+
+def _calc_atr(df, period=14):
+    hl  = df["high"] - df["low"]
+    hpc = (df["high"] - df["close"].shift(1)).abs()
+    lpc = (df["low"]  - df["close"].shift(1)).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def _add_signal_indicators(df):
+    df = df.copy()
+    df["ema50"]       = _calc_ema(df["close"], EMA_FAST)
+    df["ema200"]      = _calc_ema(df["close"], EMA_SLOW)
+    df["rsi"]         = _calc_rsi(df["close"], RSI_PERIOD)
+    df["atr"]         = _calc_atr(df, ATR_PERIOD)
+    ml, sl, hist      = _calc_macd(df["close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD)
+    df["macd"]        = ml
+    df["macd_signal"] = sl
+    df["macd_hist"]   = hist
+    df["body"]        = (df["close"] - df["open"]).abs()
+    df["upper_wick"]  = df["high"] - df[["open","close"]].max(axis=1)
+    df["lower_wick"]  = df[["open","close"]].min(axis=1) - df["low"]
+    df["range"]       = df["high"] - df["low"]
+    return df
+
+def _find_sr_levels(df_slice, atr):
+    highs, lows = [], []
+    data = df_slice.reset_index(drop=True)
+    for i in range(2, len(data) - 2):
+        h = data["high"].iloc[i]; l = data["low"].iloc[i]
+        if h == data["high"].iloc[i-2:i+3].max(): highs.append(h)
+        if l == data["low"].iloc[i-2:i+3].min():  lows.append(l)
+
+    def cluster(prices):
+        if not prices: return []
+        thr    = atr * SR_ZONE_ATR_MULT
+        levels = []; used = [False]*len(prices)
+        for i, p in enumerate(prices):
+            if used[i]: continue
+            cl = [p]; used[i] = True
+            for j in range(i+1, len(prices)):
+                if not used[j] and abs(prices[j]-p) <= thr:
+                    cl.append(prices[j]); used[j] = True
+            if len(cl) >= SR_MIN_TOUCHES:
+                levels.append((sum(cl)/len(cl), len(cl)))
+        return sorted(levels)
+
+    return cluster(highs + lows)
+
+def _detect_trend_score(row, prev_row, df20):
+    price, e50, e200 = row["close"], row["ema50"], row["ema200"]
+    if   price > e50 > e200:  ema_score = 2
+    elif price < e50 < e200:  ema_score = -2
+    elif price > e200:        ema_score = 1
+    elif price < e200:        ema_score = -1
+    else:                     ema_score = 0
+
+    mh, pmh = row["macd_hist"], prev_row["macd_hist"]
+    if   mh > 0 and mh > pmh:  macd_score = 1
+    elif mh < 0 and mh < pmh:  macd_score = -1
+    else:                       macd_score = 0
+
+    hs = df20["high"].values; ls = df20["low"].values
+    hh = hs[-1]>hs[-5]>hs[-10]; hl = ls[-1]>ls[-5]>ls[-10]
+    lh = hs[-1]<hs[-5]<hs[-10]; ll = ls[-1]<ls[-5]<ls[-10]
+    if   hh and hl:  swing = 2
+    elif lh and ll:  swing = -2
+    elif hh or hl:   swing = 1
+    elif lh or ll:   swing = -1
+    else:            swing = 0
+
+    return ema_score + macd_score + swing
+
+def _detect_patterns(c0, c1, c2, atr):
+    patterns = []
+    b0, b1   = c0["body"], c1["body"]
+    bull0 = c0["close"]>c0["open"]; bear0 = c0["close"]<c0["open"]
+    bull1 = c1["close"]>c1["open"]; bear1 = c1["close"]<c1["open"]
+    bull2 = c2["close"]>c2["open"]; bear2 = c2["close"]<c2["open"]
+
+    if bear1 and bull0 and c0["close"]>c1["open"] and c0["open"]<c1["close"] and b0>b1*1.1:
+        patterns.append(("Bullish Engulfing","BUY",3))
+    if bull1 and bear0 and c0["close"]<c1["open"] and c0["open"]>c1["close"] and b0>b1*1.1:
+        patterns.append(("Bearish Engulfing","SELL",3))
+
+    lwr = c0["lower_wick"]/c0["range"] if c0["range"]>0 else 0
+    if lwr>=0.6 and c0["upper_wick"]<b0*0.5 and b0>=atr*0.1:
+        patterns.append(("Bullish Pin Bar","BUY",2))
+    uwr = c0["upper_wick"]/c0["range"] if c0["range"]>0 else 0
+    if uwr>=0.6 and c0["lower_wick"]<b0*0.5 and b0>=atr*0.1:
+        patterns.append(("Bearish Pin Bar","SELL",2))
+
+    if bear2 and c1["body"]<atr*0.3 and bull0 and c0["close"]>(c2["open"]+c2["close"])/2:
+        patterns.append(("Morning Star","BUY",3))
+    if bull2 and c1["body"]<atr*0.3 and bear0 and c0["close"]<(c2["open"]+c2["close"])/2:
+        patterns.append(("Evening Star","SELL",3))
+
+    if c1["high"]<c2["high"] and c1["low"]>c2["low"] and bull0 and c0["close"]>c2["high"]:
+        patterns.append(("Inside Bar Breakout","BUY",2))
+    if c1["high"]<c2["high"] and c1["low"]>c2["low"] and bear0 and c0["close"]<c2["low"]:
+        patterns.append(("Inside Bar Breakdown","SELL",2))
+
+    if bull0 and bull1 and bull2 and c0["close"]>c1["close"]>c2["close"] and b0>=atr*0.3:
+        patterns.append(("3 White Soldiers","BUY",3))
+    if bear0 and bear1 and bear2 and c0["close"]<c1["close"]<c2["close"] and b0>=atr*0.3:
+        patterns.append(("3 Black Crows","SELL",3))
+
+    return patterns
+
+def score_signal(df_window):
+    """
+    Scores the latest candle in df_window.
+    Returns (direction, confidence_pct, pattern_name)
+             or (None, 0, None) if no qualified signal.
+    Identical logic to backtest Cell 4.
+    """
+    if len(df_window) < 25:
+        return None, 0, None
+
+    df_ind = _add_signal_indicators(df_window)
+    c0   = df_ind.iloc[-1]
+    c1   = df_ind.iloc[-2]
+    c2   = df_ind.iloc[-3]
+    prev = df_ind.iloc[-2]
+
+    atr_val = c0["atr"]; rsi = c0["rsi"]
+
+    trend_score = _detect_trend_score(c0, prev, df_ind.tail(20))
+    patterns    = _detect_patterns(c0, c1, c2, atr_val)
+    sr_levels   = _find_sr_levels(df_window.tail(SR_LOOKBACK), atr_val)
+    price       = c0["close"]
+
+    near_sup = any(abs(price-lvl)<=atr_val*SR_NEAR_ATR_MULT for lvl,_ in sr_levels if lvl<price)
+    near_res = any(abs(price-lvl)<=atr_val*SR_NEAR_ATR_MULT for lvl,_ in sr_levels if lvl>price)
+
+    bull_score = bear_score = 0
+    best_bull = best_bear = None
+
+    if   trend_score > 0:  bull_score += min(trend_score, 4)
+    elif trend_score < 0:  bear_score += min(abs(trend_score), 4)
+
+    for name, direction, score in patterns:
+        if direction == "BUY":
+            bull_score += score
+            if not best_bull or score > best_bull[1]: best_bull = (name, score)
+        elif direction == "SELL":
+            bear_score += score
+            if not best_bear or score > best_bear[1]: best_bear = (name, score)
+
+    if rsi <= 35:    bull_score += 2
+    elif rsi >= 65:  bear_score += 2
+    if near_sup:  bull_score += 2
+    if near_res:  bear_score += 2
+
+    mh, pmh = c0["macd_hist"], prev["macd_hist"]
+    if   mh > 0 and mh > pmh:  bull_score += 1
+    elif mh < 0 and mh < pmh:  bear_score += 1
+
+    MAX = 14.0
+    if bull_score > bear_score and best_bull:
+        return "BUY",  min(int(bull_score/MAX*100), 95), best_bull[0]
+    elif bear_score > bull_score and best_bear:
+        return "SELL", min(int(bear_score/MAX*100), 95), best_bear[0]
+    return None, 0, None
+
+
+# ════════════════════════════════════════════════════════════════════
 #  STATE PERSISTENCE
 # ════════════════════════════════════════════════════════════════════
 
@@ -216,6 +430,8 @@ def load_state():
         "last_profit"         : 0.0,
         "float_pnl"           : 0.0,
         "grids_hit"           : 0,
+        "signal_pattern"      : "",
+        "signal_confidence"   : 0,
     }
 
 
@@ -322,11 +538,14 @@ class MT5Broker:
 #  GLOBAL OBJECTS
 # ════════════════════════════════════════════════════════════════════
 
-ema            = IncrementalEMA(EMA_PERIOD)
-atr            = IncrementalATR(ATR_PERIOD)
+ema            = IncrementalEMA(EMA_SLOW)   # EMA200 for warmup tracking
+atr_inc        = IncrementalATR(ATR_PERIOD)
 state          = load_state()
 broker         = MT5Broker()
 bot_start_time = datetime.now()
+
+# Rolling candle buffer for signal scoring — kept at SR_LOOKBACK + 50
+candle_buffer: list = []
 
 mt5_status = {
     "connected"      : False,
@@ -392,23 +611,18 @@ def get_tp_exit(profit, trades, direction, entry_price, h, l):
     """
     All TP exits — candle close only.
     Profit is close-price profit, not capped at minimum target.
-    Letting the candle run means you capture more when momentum is strong.
     """
     if len(trades) == 1:
         if direction == "BUY"  and h >= entry_price + SINGLE_TRADE_TP_PTS:
             return True, "TP (no grid)", profit
         if direction == "SELL" and l <= entry_price - SINGLE_TRADE_TP_PTS:
             return True, "TP (no grid)", profit
-
     elif len(trades) == 2 and profit >= TARGET_PROFIT:
         return True, "TARGET PROFIT G1", profit
-
     elif len(trades) == 3 and profit >= TARGET_PROFIT_G2:
         return True, "TARGET PROFIT G2", profit
-
     elif len(trades) >= 4 and profit > 0:
         return True, "BREAK-EVEN RECOVERY", profit
-
     return False, "", profit
 
 
@@ -423,11 +637,11 @@ def get_sl_exit(profit):
 
 
 # ════════════════════════════════════════════════════════════════════
-#  ON NEW CANDLE
+#  ON NEW CANDLE — signal scoring + TP exits + new entries
 # ════════════════════════════════════════════════════════════════════
 
 def on_new_candle(candle):
-    global state
+    global state, candle_buffer
 
     o = float(candle["open"])
     h = float(candle["high"])
@@ -441,14 +655,18 @@ def on_new_candle(candle):
     bar_date_str = str(t.date())
     log.info(f"Candle {t}  O:{o}  H:{h}  L:{l}  C:{c}")
 
+    # Update incremental indicators
     ema.update(c)
-    atr.update(h, l, c)
+    atr_inc.update(h, l, c)
+
+    # Maintain rolling candle buffer for signal scoring
+    candle_buffer.append({"open":o,"high":h,"low":l,"close":c,"time":t,"volume":1})
+    if len(candle_buffer) > SR_LOOKBACK + 50:
+        candle_buffer.pop(0)
 
     if not ema.is_ready():
         log.info("EMA warming up — skip")
         return
-
-    current_ema = ema.value
 
     # Daily reset
     if bar_date_str != state["current_day"]:
@@ -471,7 +689,7 @@ def on_new_candle(candle):
             save_state(state)
             return
 
-    # ── Manage open basket ───────────────────────────────────────
+    # ── Manage open basket — TP exits at candle close ────────────
     if state["basket_active"]:
 
         direction   = state["direction"]
@@ -486,7 +704,8 @@ def on_new_candle(candle):
                 continue
             level      = (idx + 1) * eff_step
             grid_price = entry_price - level if direction == "BUY" else entry_price + level
-            hit = (direction == "BUY" and l <= grid_price) or                   (direction == "SELL" and h >= grid_price)
+            hit = (direction == "BUY" and l <= grid_price) or \
+                  (direction == "SELL" and h >= grid_price)
             if hit:
                 ticket, fill_price = broker.place_order(direction, SYMBOL, lot,
                                                         comment=f"Grid#{idx+1}")
@@ -534,6 +753,8 @@ def on_new_candle(candle):
                 "capital"    : round(state["capital"], 2),
                 "exit_reason": exit_reason,
                 "grids_hit"  : len(triggered),
+                "pattern"    : state.get("signal_pattern", ""),
+                "confidence" : state.get("signal_confidence", 0),
             })
 
             state["basket_active"]     = False
@@ -542,6 +763,8 @@ def on_new_candle(candle):
             state["open_tickets"]      = []
             state["entry_candle_time"] = None
             state["cooldown_counter"]  = COOLDOWN_BARS
+            state["signal_pattern"]    = ""
+            state["signal_confidence"] = 0
         else:
             state["trades"]          = [list(x) for x in trades]
             state["triggered_grids"] = list(triggered)
@@ -549,7 +772,7 @@ def on_new_candle(candle):
         save_state(state)
         return
 
-    # ── Open new basket ──────────────────────────────────────────
+    # ── Open new basket — signal filter gate ────────────────────
     is_bull = c > o
     is_bear = c < o
 
@@ -563,20 +786,34 @@ def on_new_candle(candle):
     except Exception as e:
         log.warning(f"Balance sync failed: {e}")
 
-    above_ema  = o >= current_ema
-    with_trend = (is_bull and above_ema) or (is_bear and not above_ema)
+    # Score signal — same logic as backtest
+    if len(candle_buffer) >= 25:
+        df_window = pd.DataFrame(candle_buffer)
+        sig_dir, confidence, pattern_name = score_signal(df_window)
+    else:
+        sig_dir, confidence, pattern_name = None, 0, None
+
+    direction_from_candle = "BUY" if is_bull else "SELL"
+
+    if sig_dir != direction_from_candle or confidence < MIN_CONFIDENCE:
+        log.info(f"Signal filtered  sig:{sig_dir}  conf:{confidence}%  candle:{direction_from_candle}  min:{MIN_CONFIDENCE}%")
+        save_state(state)
+        return
+
+    # Signal approved — open basket
     trade_lot  = FIXED_LOT
-    trend_tag  = "WITH-TREND" if with_trend else "COUNTER-TREND"
     grid_lots  = [trade_lot * m for m in GRID_LOT_MULTIPLIERS]
-    direction  = "BUY" if is_bull else "SELL"
+    above_ema  = o >= ema.value
+    with_trend = (is_bull and above_ema) or (is_bear and not above_ema)
+    trend_tag  = "WITH-TREND" if with_trend else "COUNTER-TREND"
 
-    log.info(f"{direction} [{trend_tag}] signal @ open:{o}  EMA:{current_ema:.2f}")
+    log.info(f"{direction_from_candle} [{trend_tag}] APPROVED  conf:{confidence}%  pattern:{pattern_name}  EMA:{ema.value:.2f}")
 
-    ticket, fill_price = broker.place_order(direction, SYMBOL, trade_lot,
-                                            comment=f"Entry {trend_tag}")
+    ticket, fill_price = broker.place_order(direction_from_candle, SYMBOL, trade_lot,
+                                            comment=f"Entry {trend_tag} {confidence}%")
 
     state["basket_active"]       = True
-    state["direction"]           = direction
+    state["direction"]           = direction_from_candle
     state["entry_price"]         = fill_price
     state["entry_time"]          = str(datetime.now())
     state["entry_candle_time"]   = str(t)
@@ -589,21 +826,27 @@ def on_new_candle(candle):
     state["grid_lots"]           = grid_lots
     state["float_pnl"]           = 0.0
     state["grids_hit"]           = 0
+    state["signal_pattern"]      = pattern_name or ""
+    state["signal_confidence"]   = confidence
 
     save_state(state)
 
 
 # ════════════════════════════════════════════════════════════════════
-#  WARMUP
+#  WARMUP — primes EMA200, ATR and candle buffer
 # ════════════════════════════════════════════════════════════════════
 
 def warmup():
+    global candle_buffer
     log.info(f"Warming up on {WARMUP_BARS} historical bars...")
     candles = broker.get_latest_candles(SYMBOL, TIMEFRAME, WARMUP_BARS)
     for c in candles[:-1]:
         ema.update(c["close"])
-        atr.update(c["high"], c["low"], c["close"])
-    log.info(f"Warmup done  EMA:{ema.value:.2f}  ATR:{atr.value:.4f}")
+        atr_inc.update(c["high"], c["low"], c["close"])
+        candle_buffer.append(c)
+    if len(candle_buffer) > SR_LOOKBACK + 50:
+        candle_buffer = candle_buffer[-(SR_LOOKBACK + 50):]
+    log.info(f"Warmup done  EMA200:{ema.value:.2f}  ATR:{atr_inc.value:.4f}  Buffer:{len(candle_buffer)} bars")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -650,6 +893,8 @@ def check_grids_realtime():
                     "cooldown_counter" : COOLDOWN_BARS,
                     "last_exit_reason" : "MANUAL CLOSE",
                     "last_profit"      : 0.0,
+                    "signal_pattern"   : "",
+                    "signal_confidence": 0,
                 })
                 save_state(state)
                 log.warning("State reset — bot will wait cooldown then resume")
@@ -684,7 +929,8 @@ def check_grids_realtime():
                 continue
             level      = (idx + 1) * eff_step
             grid_price = entry_price - level if direction == "BUY" else entry_price + level
-            hit = (direction == "BUY"  and live_price <= grid_price) or                   (direction == "SELL" and live_price >= grid_price)
+            hit = (direction == "BUY"  and live_price <= grid_price) or \
+                  (direction == "SELL" and live_price >= grid_price)
             if hit:
                 ticket, fill_price = broker.place_order(direction, SYMBOL, lot,
                                                         comment=f"Grid#{idx+1}RT")
@@ -727,6 +973,8 @@ def check_grids_realtime():
             state["entry_candle_time"] = None
             state["cooldown_counter"]  = COOLDOWN_BARS
             state["daily_sl_hit"]      = True
+            state["signal_pattern"]    = ""
+            state["signal_confidence"] = 0
             state["total_loss"]       += abs(profit)
             state["loss_trades"]      += 1
             state["trade_log"].append({
@@ -818,7 +1066,10 @@ def print_dashboard(next_mins, next_secs):
 
     if state.get("basket_active"):
         grids      = state.get("grids_hit", 0)
-        basket_str = f"{state.get('direction')} | Grids:{grids}/{len(GRID_LOT_MULTIPLIERS)} | Float:${state.get('float_pnl',0.0):+.2f}"
+        pattern    = state.get("signal_pattern", "")
+        conf       = state.get("signal_confidence", 0)
+        sig_str    = f"  [{pattern}  {conf}%]" if pattern else ""
+        basket_str = f"{state.get('direction')} | Grids:{grids}/{len(GRID_LOT_MULTIPLIERS)} | Float:${state.get('float_pnl',0.0):+.2f}{sig_str}"
         entry_str  = f"Entry @ {state.get('entry_price','?')}  |  TP exits at candle close"
         tit_str    = f"Time in trade  : {get_time_in_trade()}" if get_time_in_trade() else ""
     else:
@@ -826,7 +1077,7 @@ def print_dashboard(next_mins, next_secs):
         last_profit = state.get("last_profit", 0.0)
         last        = f"${last_profit:+.2f} [{last_reason}]" if last_reason else "None yet"
         basket_str  = f"WAITING  |  Last trade: {last}"
-        entry_str   = f"Cooldown: {state.get('cooldown_counter', 0)} bars"
+        entry_str   = f"Cooldown: {state.get('cooldown_counter', 0)} bars  |  Min confidence: {MIN_CONFIDENCE}%"
         tit_str     = ""
 
     if mt5_status["connected"]:
@@ -842,14 +1093,16 @@ def print_dashboard(next_mins, next_secs):
         algo_str  = ping_str = acct_str = bal_str = last_ping = pos_str = "N/A"
 
     ema_str = f"{ema.value:.2f}" if ema.is_ready() else "Warming up..."
-    atr_str = f"{atr.value:.4f}" if atr.is_ready() else "Warming up..."
+    atr_str = f"{atr_inc.value:.4f}" if atr_inc.is_ready() else "Warming up..."
     mkt_status, mkt_session, mkt_opens_in = get_market_session(now)
-    mkt_str = f"OPEN  |  {mkt_session}" if mkt_status == "OPEN"               else f"CLOSED  ({mkt_session})  |  Opens in: {mkt_opens_in}"
-    sl_bar  = get_daily_sl_bar(daily_pnl) if daily_pnl < 0               else f"[{'░'*20}]  0%  ($0 of ${DAILY_SL_USD:.0f} limit)"
+    mkt_str = f"OPEN  |  {mkt_session}" if mkt_status == "OPEN" \
+              else f"CLOSED  ({mkt_session})  |  Opens in: {mkt_opens_in}"
+    sl_bar  = get_daily_sl_bar(daily_pnl) if daily_pnl < 0 \
+              else f"[{'░'*20}]  0%  ($0 of ${DAILY_SL_USD:.0f} limit)"
 
-    print("=" * 64)
-    print(f"  GRID BOT  |  {now.strftime('%Y-%m-%d  %H:%M:%S')}  [Server UTC+3]")
-    print("=" * 64)
+    print("=" * 66)
+    print(f"  GRID + SIGNAL BOT  |  {now.strftime('%Y-%m-%d  %H:%M:%S')}  [UTC+3]")
+    print("=" * 66)
     print(f"  MT5            : {conn_str}")
     print(f"  Account        : {acct_str}")
     print(f"  Server         : {mt5_status['server'] or MT5_SERVER}")
@@ -859,28 +1112,29 @@ def print_dashboard(next_mins, next_secs):
         print(f"  Error          : {mt5_status['error']}")
     print(f"  Balance        : {bal_str}")
     print(f"  Open Positions : {pos_str}")
-    print("-" * 64)
+    print("-" * 66)
     print(f"  Market         : {mkt_str}")
     print(f"  Uptime         : {get_uptime()}")
     print(f"  Next candle in : {next_mins:02d}:{next_secs:02d}")
-    print(f"  EMA(200)       : {ema_str}  |  ATR(14): {atr_str}")
-    print("-" * 64)
+    print(f"  EMA(200)       : {ema_str}  |  ATR(14): {atr_str}  |  Buffer: {len(candle_buffer)} bars")
+    print("-" * 66)
     print(f"  Capital        : ${state.get('capital', INITIAL_CAPITAL):.2f}")
     print(f"  Net P&L        : ${net_pnl:+.2f}")
     print(f"  Today P&L      : ${daily_pnl:+.2f}  {'  DAILY SL HIT' if state.get('daily_sl_hit') else ''}")
     print(f"  Daily SL       : {sl_bar}")
     print(f"  Session        : {state.get('session_trades',0)} trades  |  ${state.get('session_profit',0.0):+.2f}")
-    print("-" * 64)
+    print("-" * 66)
     print(f"  Total trades   : {total}  |  Win rate: {win_rate:.1f}%")
     print(f"  Total profit   : ${state.get('total_profit',0.0):.2f}")
     print(f"  Total loss     : ${state.get('total_loss',0.0):.2f}")
-    print("-" * 64)
+    print("-" * 66)
+    print(f"  Signal filter  : Min confidence {MIN_CONFIDENCE}%")
     print(f"  TP (min)       : No grid:{SINGLE_TRADE_TP_PTS}pts | G1:${TARGET_PROFIT} | G2:${TARGET_PROFIT_G2} | G3:B/E")
     print(f"  Basket         : {basket_str}")
     print(f"                   {entry_str}")
     if tit_str:
         print(f"                   {tit_str}")
-    print("=" * 64)
+    print("=" * 66)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -889,12 +1143,13 @@ def print_dashboard(next_mins, next_secs):
 
 async def main():
     log.info("=" * 60)
-    log.info("Grid Strategy Live")
+    log.info("Grid Strategy + Signal Filter — Live")
     log.info(f"Account  : {MT5_LOGIN}  Server: {MT5_SERVER}")
     log.info(f"Symbol   : {SYMBOL}  Lot: {FIXED_LOT}  Grid: {GRID_STEP}pts")
     log.info(f"Daily SL : ${DAILY_SL_USD}  (fires immediately)")
     log.info(f"TP min   : No-grid:{SINGLE_TRADE_TP_PTS}pts  G1:${TARGET_PROFIT}  G2:${TARGET_PROFIT_G2}")
     log.info(f"TP mode  : Candle close — profits ride the full candle")
+    log.info(f"Signal   : Min confidence {MIN_CONFIDENCE}%")
     log.info("=" * 60)
 
     broker.connect()
