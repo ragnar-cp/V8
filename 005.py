@@ -72,6 +72,8 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 
+from telegram_notify import TelegramNotifier
+
 
 # ════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -547,6 +549,12 @@ bot_start_time = datetime.now()
 # Rolling candle buffer for signal scoring — kept at SR_LOOKBACK + 50
 candle_buffer: list = []
 
+# Telegram notifier
+notifier = TelegramNotifier()
+
+# Track connection state for disconnect/reconnect alerts
+_last_connection_state = True
+
 mt5_status = {
     "connected"      : False,
     "last_ping"      : None,
@@ -598,9 +606,21 @@ def check_mt5_connection():
         })
         positions = mt5.positions_get()
         mt5_status["open_positions"] = len(positions) if positions else 0
+
+        # Reconnect alert
+        global _last_connection_state
+        if not _last_connection_state:
+            notifier.connection_restored(info.balance)
+        _last_connection_state = True
+
     except Exception as e:
         mt5_status["connected"] = False
         mt5_status["error"]     = str(e)
+        # Disconnect alert — only fires once, not every 0.3s
+        global _last_connection_state
+        if _last_connection_state:
+            notifier.connection_lost()
+        _last_connection_state = False
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -676,6 +696,12 @@ def on_new_candle(candle):
         state["session_trades"]      = 0
         state["session_profit"]      = 0.0
         log.info(f"NEW DAY {bar_date_str}  Capital:{state['capital']:.2f}  DailySL:${DAILY_SL_USD}")
+        # Send previous day summary if there were trades
+        if state.get("session_trades", 0) > 0:
+            notifier.daily_summary(
+                state["session_trades"], state["session_profit"],
+                state["win_trades"], state["loss_trades"], state["capital"]
+            )
 
     if state["daily_sl_hit"]:
         if state["cooldown_counter"] > 0:
@@ -713,6 +739,7 @@ def on_new_candle(candle):
                 triggered.add(idx)
                 state["open_tickets"].append(ticket)
                 log.info(f"Grid #{idx+1} @ fill:{fill_price}  Lot:{lot}")
+                notifier.grid_triggered(idx+1, fill_price, lot, state.get("float_pnl", 0), direction)
 
         # Profit at candle close
         if direction == "BUY":
@@ -738,6 +765,7 @@ def on_new_candle(candle):
             state["float_pnl"]         = 0.0
             state["grids_hit"]         = 0
             log.info(f"CANDLE-CLOSE EXIT [{exit_reason}]  P&L:{profit:.2f}  Capital:{state['capital']:.2f}")
+            notifier.trade_exit(exit_reason, profit, state["capital"], len(triggered), direction)
 
             if profit > 0:
                 state["total_profit"] += profit
@@ -808,9 +836,9 @@ def on_new_candle(candle):
     trend_tag  = "WITH-TREND" if with_trend else "COUNTER-TREND"
 
     log.info(f"{direction_from_candle} [{trend_tag}] APPROVED  conf:{confidence}%  pattern:{pattern_name}  EMA:{ema.value:.2f}")
-
     ticket, fill_price = broker.place_order(direction_from_candle, SYMBOL, trade_lot,
                                             comment=f"Entry {trend_tag} {confidence}%")
+    notifier.signal_approved(direction_from_candle, confidence, pattern_name or "", fill_price, trend_tag)
 
     state["basket_active"]       = True
     state["direction"]           = direction_from_candle
@@ -898,6 +926,7 @@ def check_grids_realtime():
                 })
                 save_state(state)
                 log.warning("State reset — bot will wait cooldown then resume")
+                notifier.manual_close_detected(len(open_tickets))
                 return
 
             elif len(still_open) < len(open_tickets):
@@ -940,6 +969,7 @@ def check_grids_realtime():
                 state["grids_hit"] = len(triggered)
                 new_grid_hit       = True
                 log.info(f"REALTIME Grid #{idx+1} @ live:{live_price}  fill:{fill_price}  Lot:{lot}")
+                notifier.grid_triggered(idx+1, fill_price, lot, state.get("float_pnl", 0), direction)
 
         # Update float P&L for dashboard
         if direction == "BUY":
@@ -986,6 +1016,7 @@ def check_grids_realtime():
                 "grids_hit"  : len(triggered),
             })
             log.info(f"IMMEDIATE SL EXIT  P&L:{profit:.2f}  Capital:{state['capital']:.2f}")
+            notifier.sl_hit(profit, state["capital"])
             save_state(state)
 
     except Exception as e:
@@ -1154,6 +1185,7 @@ async def main():
 
     broker.connect()
     warmup()
+    notifier.bot_started(SYMBOL, FIXED_LOT, GRID_STEP, MIN_CONFIDENCE, DAILY_SL_USD)
 
     schedule.every().hour.at(":00").do(tick)
     schedule.every().hour.at(":15").do(tick)
