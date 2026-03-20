@@ -1183,6 +1183,12 @@ async def main():
 
     broker.connect()
     warmup()
+
+    # Link live state to notifier so /status command has real data
+    notifier.state_ref     = state
+    notifier.mt5_ref       = mt5_status
+    notifier.bot_start_ref = bot_start_time
+
     notifier.bot_started(SYMBOL, FIXED_LOT, GRID_STEP, MIN_CONFIDENCE, DAILY_SL_USD)
 
     schedule.every().hour.at(":00").do(tick)
