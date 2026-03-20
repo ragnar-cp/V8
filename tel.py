@@ -1,28 +1,26 @@
 """
-Telegram Notifier for Grid Strategy Bot
-========================================
+Telegram Notifier + Command Listener for Grid Strategy Bot
+===========================================================
 
 SETUP:
 1. pip install requests
-2. Make sure this file is in the same folder as grid_strategy_live.py
-3. Import and use in grid_strategy_live.py:
-       from telegram_notify import TelegramNotifier
-       notifier = TelegramNotifier()
+2. Put this file in the same folder as grid_strategy_live.py
+3. Already imported and used in grid_strategy_live.py
 
-USAGE in grid_strategy_live.py:
-   notifier.signal_approved(direction, confidence, pattern, entry_price, trend_tag)
-   notifier.trade_exit(exit_reason, profit, capital, grids_hit, direction)
-   notifier.grid_triggered(grid_num, fill_price, lot, float_pnl, direction)
-   notifier.sl_hit(profit, capital)
-   notifier.daily_summary(session_trades, session_profit, win_trades, loss_trades, capital)
-   notifier.bot_started(symbol, lot, grid_step, min_confidence, daily_sl)
-   notifier.bot_error(error_message)
-   notifier.connection_lost()
-   notifier.connection_restored(balance)
+TELEGRAM COMMANDS (send these to your bot):
+   /status  → replies with full live bot status
+   /help    → lists available commands
+
+HOW IT WORKS:
+   A background thread polls Telegram for incoming messages every 2 seconds.
+   When you send /status, the bot replies instantly with current state.
+   Does not block or slow down the trading loop.
 """
 
 import requests
 import logging
+import threading
+import time
 from datetime import datetime
 
 log = logging.getLogger(__name__)
@@ -36,47 +34,249 @@ CHAT_ID   = "7858967749"
 
 
 # ════════════════════════════════════════════════════════════════════
-#  TELEGRAM NOTIFIER
+#  TELEGRAM NOTIFIER + COMMAND LISTENER
 # ════════════════════════════════════════════════════════════════════
 
 class TelegramNotifier:
 
     def __init__(self, bot_token=BOT_TOKEN, chat_id=CHAT_ID):
-        self.bot_token = bot_token
-        self.chat_id   = chat_id
-        self.base_url  = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        self.bot_token   = bot_token
+        self.chat_id     = chat_id
+        self.base_url    = f"https://api.telegram.org/bot{self.bot_token}"
+        self._last_update_id = None
+
+        # Reference to live state — set by live bot after init
+        # notifier.state_ref    = state
+        # notifier.mt5_ref      = mt5_status
+        # notifier.bot_start_ref = bot_start_time
+        self.state_ref     = None
+        self.mt5_ref       = None
+        self.bot_start_ref = None
+
         self._test_connection()
+        self._start_command_listener()
 
     def _test_connection(self):
         try:
-            url      = f"https://api.telegram.org/bot{self.bot_token}/getMe"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                name = response.json().get("result", {}).get("first_name", "Bot")
-                log.info(f"Telegram connected — bot name: {name}")
+            r = requests.get(f"{self.base_url}/getMe", timeout=5)
+            if r.status_code == 200:
+                name = r.json().get("result", {}).get("first_name", "Bot")
+                log.info(f"Telegram connected — bot: {name}")
             else:
-                log.warning(f"Telegram connection test failed: {response.status_code}")
+                log.warning(f"Telegram connection test failed: {r.status_code}")
         except Exception as e:
             log.warning(f"Telegram connection test error: {e}")
 
-    def _send(self, message: str):
-        """Send a message. Fails silently so bot never crashes on Telegram errors."""
+    def _send(self, message: str, chat_id=None):
+        """Send a message. Fails silently so bot never crashes."""
         try:
-            payload  = {
-                "chat_id"    : self.chat_id,
-                "text"       : message,
-                "parse_mode" : "HTML",
+            payload = {
+                "chat_id"   : chat_id or self.chat_id,
+                "text"      : message,
+                "parse_mode": "HTML",
             }
-            response = requests.post(self.base_url, json=payload, timeout=5)
-            if response.status_code != 200:
-                log.warning(f"Telegram send failed: {response.status_code}  {response.text[:100]}")
+            r = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=5)
+            if r.status_code != 200:
+                log.warning(f"Telegram send failed: {r.status_code}  {r.text[:100]}")
         except Exception as e:
             log.warning(f"Telegram send error: {e}")
 
     def _now(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ── Bot lifecycle ─────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  COMMAND LISTENER — runs in background thread
+    # ════════════════════════════════════════════════════════════════
+
+    def _start_command_listener(self):
+        """Start background thread that polls for Telegram commands every 2s."""
+        t = threading.Thread(target=self._poll_commands, daemon=True)
+        t.start()
+        log.info("Telegram command listener started — send /status to check bot")
+
+    def _poll_commands(self):
+        """Background polling loop — checks for new messages every 2 seconds."""
+        while True:
+            try:
+                params = {"timeout": 1, "allowed_updates": ["message"]}
+                if self._last_update_id is not None:
+                    params["offset"] = self._last_update_id + 1
+
+                r = requests.get(f"{self.base_url}/getUpdates",
+                                 params=params, timeout=10)
+                if r.status_code == 200:
+                    updates = r.json().get("result", [])
+                    for update in updates:
+                        self._last_update_id = update["update_id"]
+                        self._handle_update(update)
+            except Exception as e:
+                log.debug(f"Telegram poll error: {e}")
+            time.sleep(2)
+
+    def _handle_update(self, update):
+        """Process an incoming message."""
+        try:
+            message = update.get("message", {})
+            text    = message.get("text", "").strip().lower()
+            from_id = str(message.get("chat", {}).get("id", ""))
+
+            # Only respond to your own chat ID for security
+            if from_id != str(self.chat_id):
+                log.warning(f"Ignored message from unknown chat_id: {from_id}")
+                return
+
+            if text in ["/status", "/status@" + self._get_bot_username()]:
+                self._reply_status(from_id)
+            elif text in ["/help", "/help@" + self._get_bot_username()]:
+                self._reply_help(from_id)
+            else:
+                self._send(
+                    f"❓ Unknown command: <code>{text}</code>\n"
+                    f"Send /help to see available commands.",
+                    chat_id=from_id
+                )
+        except Exception as e:
+            log.debug(f"Telegram handle update error: {e}")
+
+    def _get_bot_username(self):
+        """Get bot username for command matching (cached)."""
+        try:
+            if not hasattr(self, "_bot_username"):
+                r = requests.get(f"{self.base_url}/getMe", timeout=5)
+                self._bot_username = r.json().get("result", {}).get("username", "")
+            return self._bot_username
+        except Exception:
+            return ""
+
+    # ════════════════════════════════════════════════════════════════
+    #  /status REPLY
+    # ════════════════════════════════════════════════════════════════
+
+    def _reply_status(self, chat_id):
+        """Build and send a full live status reply."""
+        try:
+            s   = self.state_ref
+            mt5 = self.mt5_ref
+
+            # If state not linked yet, send basic alive message
+            if s is None:
+                self._send(
+                    f"✅ <b>BOT IS ALIVE</b>\n"
+                    f"🕐 {self._now()}\n"
+                    f"⚠️ State not linked yet — bot may still be warming up.",
+                    chat_id=chat_id
+                )
+                return
+
+            # Uptime
+            if self.bot_start_ref:
+                delta   = datetime.now() - self.bot_start_ref
+                total   = int(delta.total_seconds())
+                h = total//3600; m = (total%3600)//60; sc = total%60
+                uptime  = f"{h}h {m:02d}m {sc:02d}s" if h > 0 else f"{m}m {sc:02d}s"
+            else:
+                uptime = "Unknown"
+
+            # Capital stats
+            initial  = s.get("capital", 10000)
+            capital  = s.get("capital", 10000)
+            net_pnl  = capital - s.get("capital", capital)
+            daily_pnl = capital - s.get("capital_at_day_open", capital)
+
+            # Win rate
+            wins   = s.get("win_trades", 0)
+            losses = s.get("loss_trades", 0)
+            total_t = wins + losses
+            wr      = f"{wins/total_t*100:.1f}%" if total_t > 0 else "N/A"
+
+            # MT5 connection
+            if mt5 and mt5.get("connected"):
+                conn_str = f"✅ CONNECTED  ({mt5.get('ping_ms','?')} ms)"
+                bal_str  = f"${mt5.get('balance',0):,.2f}"
+            else:
+                conn_str = "❌ DISCONNECTED"
+                bal_str  = "N/A"
+
+            # Basket status
+            if s.get("basket_active"):
+                grids       = s.get("grids_hit", 0)
+                direction   = s.get("direction", "?")
+                entry_price = s.get("entry_price", "?")
+                float_pnl   = s.get("float_pnl", 0.0)
+                pattern     = s.get("signal_pattern", "")
+                conf        = s.get("signal_confidence", 0)
+                pnl_emoji   = "📈" if float_pnl >= 0 else "📉"
+                sig_str     = f"\n🔬 Signal      : {pattern} ({conf}%)" if pattern else ""
+                basket_str  = (
+                    f"🟡 <b>TRADE OPEN</b>\n"
+                    f"📍 Direction   : {direction}\n"
+                    f"💲 Entry price : {entry_price}\n"
+                    f"⚡ Grids hit   : {grids}\n"
+                    f"{pnl_emoji} Float P&L   : ${float_pnl:+.2f}"
+                    f"{sig_str}"
+                )
+            else:
+                cooldown   = s.get("cooldown_counter", 0)
+                last_exit  = s.get("last_exit_reason", "")
+                last_profit= s.get("last_profit", 0.0)
+                sl_hit     = s.get("daily_sl_hit", False)
+
+                if sl_hit:
+                    basket_str = "⛔ <b>DAILY SL HIT — no more trades today</b>"
+                elif cooldown > 0:
+                    basket_str = f"⏳ <b>WAITING</b> — cooldown {cooldown} bars remaining"
+                else:
+                    last_str = f"${last_profit:+.2f} [{last_exit}]" if last_exit else "None yet"
+                    basket_str = f"👀 <b>WATCHING FOR SIGNAL</b>\nLast trade: {last_str}"
+
+            msg = (
+                f"📊 <b>BOT STATUS</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 Time        : {self._now()}\n"
+                f"⏱️ Uptime       : {uptime}\n"
+                f"📡 MT5          : {conn_str}\n"
+                f"💰 Balance      : {bal_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏦 Bot Capital  : ${capital:,.2f}\n"
+                f"📅 Today P&L    : ${daily_pnl:+.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📈 Total trades : {total_t}  |  WR: {wr}\n"
+                f"✅ Wins         : {wins}\n"
+                f"❌ Losses       : {losses}\n"
+                f"💵 Session P&L  : ${s.get('session_profit',0.0):+.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{basket_str}"
+            )
+            self._send(msg, chat_id=chat_id)
+
+        except Exception as e:
+            self._send(f"✅ Bot is alive but status error: {e}", chat_id=chat_id)
+            log.warning(f"Status reply error: {e}")
+
+    def _reply_help(self, chat_id):
+        msg = (
+            f"🤖 <b>GRID BOT COMMANDS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"/status — Full live bot status\n"
+            f"          Shows MT5 connection, capital,\n"
+            f"          open trade, grids, float P&L,\n"
+            f"          win rate and daily stats\n\n"
+            f"/help   — Show this message\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📲 Automatic alerts sent for:\n"
+            f"  • Signal approved + entry\n"
+            f"  • Grid triggered\n"
+            f"  • Trade closed (win/loss)\n"
+            f"  • Stop loss hit\n"
+            f"  • MT5 disconnect / reconnect\n"
+            f"  • Daily summary\n"
+            f"  • Manual close detected"
+        )
+        self._send(msg, chat_id=chat_id)
+
+    # ════════════════════════════════════════════════════════════════
+    #  NOTIFICATION METHODS
+    # ════════════════════════════════════════════════════════════════
 
     def bot_started(self, symbol, lot, grid_step, min_confidence, daily_sl):
         msg = (
@@ -90,7 +290,7 @@ class TelegramNotifier:
             f"🛡️ Daily SL   : ${daily_sl}\n"
             f"🕯️ TP mode    : Candle close\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Bot is live and watching for signals."
+            f"Send /status anytime to check bot."
         )
         self._send(msg)
 
@@ -131,10 +331,8 @@ class TelegramNotifier:
         )
         self._send(msg)
 
-    # ── Signal & entry ────────────────────────────────────────────
-
     def signal_approved(self, direction, confidence, pattern, entry_price, trend_tag):
-        arrow  = "🟢 BUY  📈" if direction == "BUY" else "🔴 SELL 📉"
+        arrow = "🟢 BUY  📈" if direction == "BUY" else "🔴 SELL 📉"
         msg = (
             f"{arrow} <b>SIGNAL APPROVED — ENTRY</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -159,8 +357,6 @@ class TelegramNotifier:
         )
         self._send(msg)
 
-    # ── Grid triggers ─────────────────────────────────────────────
-
     def grid_triggered(self, grid_num, fill_price, lot, float_pnl, direction):
         pnl_emoji = "📈" if float_pnl >= 0 else "📉"
         msg = (
@@ -174,15 +370,11 @@ class TelegramNotifier:
         )
         self._send(msg)
 
-    # ── Trade exits ───────────────────────────────────────────────
-
     def trade_exit(self, exit_reason, profit, capital, grids_hit, direction):
         if profit > 0:
-            result_emoji = "✅"
-            result_label = "WIN"
+            result_emoji = "✅"; result_label = "WIN"
         else:
-            result_emoji = "❌"
-            result_label = "LOSS"
+            result_emoji = "❌"; result_label = "LOSS"
 
         reason_emoji = {
             "TP (no grid)"       : "🎯",
@@ -207,7 +399,7 @@ class TelegramNotifier:
 
     def sl_hit(self, profit, capital):
         msg = (
-            f"🛑 <b>STOP LOSS HIT — DAILY SL TRIGGERED</b>\n"
+            f"🛑 <b>STOP LOSS — DAILY SL TRIGGERED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🕐 Time    : {self._now()}\n"
             f"💸 Loss    : ${profit:+.2f}\n"
@@ -216,10 +408,8 @@ class TelegramNotifier:
         )
         self._send(msg)
 
-    # ── Daily summary ─────────────────────────────────────────────
-
     def daily_summary(self, session_trades, session_profit, win_trades, loss_trades, capital):
-        win_rate = (win_trades / session_trades * 100) if session_trades > 0 else 0
+        win_rate  = (win_trades / session_trades * 100) if session_trades > 0 else 0
         pnl_emoji = "📈" if session_profit >= 0 else "📉"
         msg = (
             f"📋 <b>DAILY SUMMARY</b>\n"
@@ -234,8 +424,6 @@ class TelegramNotifier:
         )
         self._send(msg)
 
-    # ── Manual close detected ─────────────────────────────────────
-
     def manual_close_detected(self, num_positions):
         msg = (
             f"🤚 <b>MANUAL CLOSE DETECTED</b>\n"
@@ -248,7 +436,7 @@ class TelegramNotifier:
 
 
 # ════════════════════════════════════════════════════════════════════
-#  QUICK TEST — run this file directly to test your connection
+#  QUICK TEST — run this file directly to test your Telegram
 # ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -265,4 +453,11 @@ if __name__ == "__main__":
     n.trade_exit("TARGET PROFIT G1", 87.30, 10087.30, 1, "BUY")
     n.daily_summary(5, 143.20, 4, 1, 10143.20)
 
-    print("Done — check your Telegram!")
+    print("\nCommand listener is running — send /status or /help to your bot now")
+    print("Press Ctrl+C to stop\n")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Stopped")
